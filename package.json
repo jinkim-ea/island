@@ -21,7 +21,7 @@
     "@types/bl": "^0.8.30",
     "@types/bluebird": "^3.0.35",
     "@types/inversify": "2.0.32",
-    "@types/jasmine": "^2.5.37",
+    "@types/jasmine": "2.5.37",
     "@types/jsonwebtoken": "^7.1.33",
     "@types/lodash": "4.14.56",
     "@types/mongoose": "^4.5.41",
