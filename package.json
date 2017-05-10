@@ -44,6 +44,7 @@
     "island-loggers": "^1.0.0",
     "lodash": "^4.16.1",
     "mongoose": "^4.6.1",
+    "mongodb-uri": "0.9.7",
     "msgpack5": "^3.4.0",
     "uuid": "^3.0.1",
     "qs": "^6.2.1",
