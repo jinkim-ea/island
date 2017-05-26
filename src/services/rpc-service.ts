@@ -127,6 +127,7 @@ function enterScope(properties: any, func): Promise<any> {
   });
 }
 
+// [TODO] should be (value: T) => Promise<T>
 export type RpcHook = (rpc) => Promise<any>;
 export enum RpcHookType {
   PRE_ENDPOINT,
@@ -141,6 +142,52 @@ export enum RpcHookType {
 
 export interface InitializeOptions {
   noReviver?: boolean;
+}
+
+function createTraceLog({ tattoo, timestamp, msg, headers, rpcName, serviceName }) {
+  const log = new TraceLog(tattoo, timestamp);
+  log.size = msg.content.byteLength;
+  log.from = headers.from;
+  log.to = { node: process.env.HOSTNAME, context: rpcName, island: serviceName, type: 'rpc' };
+  return log;
+}
+
+function sanitizeAndValidate(content, rpcOptions) {
+  if (rpcOptions) {
+    if (_.get(rpcOptions, 'schema.query.sanitization')) {
+      content = sanitize(rpcOptions.schema!.query!.sanitization, content);
+    }
+    if (_.get(rpcOptions, 'schema.query.validation')) {
+      if (!validate(rpcOptions.schema!.query!.validation, content)) {
+        throw new LogicError(ISLAND.LOGIC.L0002_WRONG_PARAMETER_SCHEMA, `Wrong parameter schema`);
+      }
+    }
+  }
+  return content;
+}
+
+function parseContent(content: Buffer, reviver, rpcOptions) {
+  const parsed = JSON.parse(content.toString('utf8'), reviver);
+  return sanitizeAndValidate(parsed, rpcOptions);
+}
+
+function sanitizeAndValidateResult(res, rpcOptions?: RpcOptions) {
+  if (!rpcOptions) return res;
+  if (_.get(rpcOptions, 'schema.result.sanitization')) {
+    res = sanitize(rpcOptions.schema!.result!.sanitization, res);
+  }
+  if (_.get(rpcOptions, 'schema.result.validation')) {
+    validate(rpcOptions.schema!.result!.validation, res);
+  }
+  return res;
+}
+
+// 503(Service Temporarily Unavailable) 오류일 때는 응답을 caller에게 안보내줘야함
+function earlyThrowWith503(err) {
+  if (err.statusCode && parseInt(err.statusCode, 10) === 503) {
+    throw err;
+  }
+  return err;
 }
 
 export default class RPCService {
@@ -223,114 +270,59 @@ export default class RPCService {
   // 무척 헷갈림 @kson //2016-08-09
   // [TODO] Endpoint도 동일하게 RpcService.register를 부르는데, rpcOptions는 Endpoint가 아닌 RPC만 전달한다
   // 포함 관계가 잘못됐다. 애매하다. @kson //2016-08-09
-  public async register(name: string,
+  public async register(rpcName: string,
                         handler: (req: any) => Promise<any>,
                         type: 'endpoint' | 'rpc',
                         rpcOptions?: RpcOptions): Promise<void> {
     const consumer = (msg: Message) => {
-      if (!msg.properties.replyTo) throw ISLAND.FATAL.F0026_MISSING_REPLYTO_IN_RPC;
-      const replyTo = msg.properties.replyTo;
-      const headers = msg.properties.headers;
+      const { replyTo, headers } = msg.properties;
+      if (!replyTo) throw ISLAND.FATAL.F0026_MISSING_REPLYTO_IN_RPC;
+
       const tattoo = headers && headers.tattoo;
       const timestamp = msg.properties.timestamp || 0;
-      const log = new TraceLog(tattoo, timestamp);
+      const log = createTraceLog({ tattoo, timestamp, msg, headers, rpcName, serviceName: this.serviceName });
       this.onGoingRpcRequestCount++;
-      log.size = msg.content.byteLength;
-      log.from = headers.from;
-      log.to = { node: process.env.HOSTNAME, context: name, island: this.serviceName, type: 'rpc' };
-      return enterScope({ RequestTrackId: tattoo, Context: name, Type: 'rpc' }, () => {
-        let content = JSON.parse(msg.content.toString('utf8'), RpcResponse.reviver);
-        if (rpcOptions) {
-          if (_.get(rpcOptions, 'schema.query.sanitization')) {
-            content = sanitize(rpcOptions.schema!.query!.sanitization, content);
-          }
-          if (_.get(rpcOptions, 'schema.query.validation')) {
-            if (!validate(rpcOptions.schema!.query!.validation, content)) {
-              throw new LogicError(ISLAND.LOGIC.L0002_WRONG_PARAMETER_SCHEMA, `Wrong parameter schema`);
-            }
+      return this.enterCLS(tattoo, rpcName, async () => {
+        const req = parseContent(msg.content, reviver, rpcOptions);
+
+        logger.debug(`Got ${rpcName} with ${JSON.stringify(req)}`);
+
+        const options: amqp.Options.Publish = { correlationId: msg.properties.correlationId, headers };
+        try {
+          const res = await Bluebird.resolve()
+            .then(()  => this.dohook('pre', type, req))
+            .then(req => handler(req))
+            .then(res => this.dohook('post', type, res))
+            .then(res => sanitizeAndValidateResult(res, rpcOptions))
+            .then(res => this.reply(replyTo, res, options))
+            .timeout(RPC_EXEC_TIMEOUT_MS);
+          logger.debug(`responses ${JSON.stringify(res)}`);
+          log.end();
+        } catch (err) {
+          await Bluebird.resolve(err)
+            .then(err => earlyThrowWith503(err))
+            .tap (err => log.end(err))
+            .then(err => this.dohook('pre-error', type, err))
+            .then(err => this.reply(replyTo, err, options))
+            .then(err => this.dohook('post-error', type, err));
+          this.logRpcError(err, rpcName, req);
+          throw err;
+        } finally {
+          log.shoot();
+          if (--this.onGoingRpcRequestCount < 1 && this.purging) {
+            this.purging();
           }
         }
-
-        logger.debug(`Got ${name} with ${JSON.stringify(content)}`);
-
-        // Should wrap with Bluebird.try while handler sometimes returns ES6 Promise which doesn't support timeout.
-        const options: amqp.Options.Publish = { correlationId: msg.properties.correlationId, headers };
-        return Bluebird.try(async () => {
-          const req = content;
-          if (type === 'endpoint') {
-            return await this.dohook(RpcHookType.PRE_ENDPOINT, req);
-          } else { // rpc
-            return await this.dohook(RpcHookType.PRE_RPC, req);
-          }
-        })
-          .then(req => handler(req))
-          .then(async res => {
-            if (type === 'endpoint') {
-              return await this.dohook(RpcHookType.POST_ENDPOINT, res);
-            } else { // rpc
-              return await this.dohook(RpcHookType.POST_RPC, res);
-            }
-          })
-          .then(res => {
-            logger.debug(`responses ${JSON.stringify(res)}`);
-            log.end();
-            if (rpcOptions) {
-              if (_.get(rpcOptions, 'schema.result.sanitization')) {
-                res = sanitize(rpcOptions.schema!.result!.sanitization, res);
-              }
-              if (_.get(rpcOptions, 'schema.result.validation')) {
-                validate(rpcOptions.schema!.result!.validation, res);
-              }
-            }
-            this.channelPool.usingChannel(channel => {
-              return Promise.resolve(channel.sendToQueue(replyTo, RpcResponse.encode(res, this.serviceName), options));
-            });
-          })
-          .timeout(RPC_EXEC_TIMEOUT_MS)
-          .catch(async err => {
-            if (type === 'endpoint') {
-              err = await this.dohook(RpcHookType.PRE_ENDPOINT_ERROR, err);
-            } else { // rpc
-              err = await this.dohook(RpcHookType.PRE_RPC_ERROR, err);
-            }
-            log.end(err);
-            // 503 오류일 때는 응답을 caller에게 안보내줘야함
-            if (err.statusCode && parseInt(err.statusCode, 10) === 503) {
-              throw err;
-            }
-            if (!err.extra) {
-              err.extra = { island: this.serviceName, name, req: content };
-            }
-            const extra = err.extra;
-            logger.error(`Got an error during ${extra.island}/${extra.name}` +
-              ` with ${JSON.stringify(extra.req)} - ${err.stack}`);
-            return this.channelPool.usingChannel(channel => {
-              return Promise.resolve(channel.sendToQueue(replyTo, RpcResponse.encode(err, this.serviceName), options));
-            }).then(async () => {
-              if (type === 'endpoint') {
-                err = await this.dohook(RpcHookType.POST_ENDPOINT_ERROR, err);
-              } else { // rpc
-                err = await this.dohook(RpcHookType.POST_RPC_ERROR, err);
-              }
-              throw err;
-            });
-          })
-          .finally(() => {
-            log.shoot();
-            if (--this.onGoingRpcRequestCount < 1 && this.purging) {
-              this.purging();
-            }
-        });
       });
     };
 
     // NOTE: 컨슈머가 0개 이상에서 0개가 될 때 자동으로 삭제된다.
     // 단 한번도 컨슈머가 등록되지 않는다면 영원히 삭제되지 않는데 그런 케이스는 없음
-    await this.channelPool.usingChannel(channel => channel.assertQueue(name, {
+    await this.channelPool.usingChannel(channel => channel.assertQueue(rpcName, {
                 arguments : {'x-expires': RPC_QUEUE_EXPIRES_MS},
                 durable   : false
     }));
-    this.consumerInfosMap[name] = await this._consume(name, consumer, 'SomeoneCallsMe');
+    this.consumerInfosMap[rpcName] = await this._consume(rpcName, consumer, 'SomeoneCallsMe');
   }
 
   public async pause(name: string) {
@@ -432,9 +424,39 @@ export default class RPCService {
       await this.channelPool.releaseChannel(consumerInfo.channel);
   }
 
-  private async dohook(type: RpcHookType, value) {
-    if (!this.hooks[type]) return value;
-    return Bluebird.reduce(this.hooks[type], async (value, hook) => await hook(value), value);
+  private logRpcError(err, rpcName, req) {
+    err.extra = err.extra || { island: this.serviceName, rpcName, req };
+    logger.error(`Got an error during ${err.extra.island}/${err.extra.name}` +
+      ` with ${JSON.stringify(err.extra.req)} - ${err.stack}`);
+  }
+
+  // returns value again for convenience
+  private async reply(replyTo: string, value: any, options: amqp.Options.Publish) {
+    await this.channelPool.usingChannel(channel => {
+      return Promise.resolve(channel.sendToQueue(replyTo, RpcResponse.encode(value, this.serviceName), options));
+    });
+    return value;
+  }
+
+  // enter continuation-local-storage scope
+  private enterCLS(tattoo, rpcName, func) {
+    return enterScope({ RequestTrackId: tattoo, Context: rpcName, Type: 'rpc' }, func);
+  }
+
+  private async dohook(prefix: 'pre' | 'post' | 'pre-error' | 'post-error', type: 'endpoint' | 'rpc', value) {
+    const hookType = {
+      endpoint: {
+        pre: RpcHookType.PRE_ENDPOINT, post: RpcHookType.POST_ENDPOINT,
+        'pre-error': RpcHookType.PRE_ENDPOINT_ERROR, 'post-error': RpcHookType.POST_ENDPOINT_ERROR
+      },
+      rpc: {
+        pre: RpcHookType.PRE_RPC, post: RpcHookType.POST_RPC,
+        'pre-error': RpcHookType.PRE_RPC_ERROR, 'post-error': RpcHookType.POST_RPC_ERROR
+      }
+    }[type][prefix];
+    const hook = this.hooks[hookType];
+    if (!hook) return value;
+    return Bluebird.reduce(this.hooks[hookType], (value, hook) => hook(value), value);
   }
 
   private markTattoo(name: string, corrId: any, tattoo: any, ns: any, opts: any): Promise<any> {
