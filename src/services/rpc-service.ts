@@ -274,8 +274,14 @@ export default class RPCService {
                         handler: (req: any) => Promise<any>,
                         type: 'endpoint' | 'rpc',
                         rpcOptions?: RpcOptions): Promise<void> {
+    // NOTE: 컨슈머가 0개 이상에서 0개가 될 때 자동으로 삭제된다.
+    // 단 한번도 컨슈머가 등록되지 않는다면 영원히 삭제되지 않는데 그런 케이스는 없음
+    await this.channelPool.usingChannel(channel => channel.assertQueue(rpcName, {
+      arguments : {'x-expires': RPC_QUEUE_EXPIRES_MS},
+      durable   : false
+    }));
     const consumer = (msg: Message) => {
-      const { replyTo, headers } = msg.properties;
+      const { replyTo, headers, correlationId } = msg.properties;
       if (!replyTo) throw ISLAND.FATAL.F0026_MISSING_REPLYTO_IN_RPC;
 
       const tattoo = headers && headers.tattoo;
@@ -287,25 +293,25 @@ export default class RPCService {
 
         logger.debug(`Got ${rpcName} with ${JSON.stringify(req)}`);
 
-        const options: amqp.Options.Publish = { correlationId: msg.properties.correlationId, headers };
+        const options = { correlationId, headers };
         try {
-          const res = await Bluebird.resolve()
+          await Bluebird.resolve()
             .then(()  => this.dohook('pre', type, req))
             .then(req => handler(req))
             .then(res => this.dohook('post', type, res))
-            .then(res => sanitizeAndValidateResult(res, rpcOptions))
+            .then(res => sanitizeAndValidateResult(res, rpcOptions)) ///< [TODO] 얘를 훅으로 넣고 싶다.
             .then(res => this.reply(replyTo, res, options))
+            .tap (()  => log.end())
+            .tap (res => logger.debug(`responses ${JSON.stringify(res)}`))
             .timeout(RPC_EXEC_TIMEOUT_MS);
-          logger.debug(`responses ${JSON.stringify(res)}`);
-          log.end();
         } catch (err) {
           await Bluebird.resolve(err)
             .then(err => earlyThrowWith503(err))
             .tap (err => log.end(err))
             .then(err => this.dohook('pre-error', type, err))
             .then(err => this.reply(replyTo, err, options))
-            .then(err => this.dohook('post-error', type, err));
-          this.logRpcError(err, rpcName, req);
+            .then(err => this.dohook('post-error', type, err))
+            .tap (err => this.logRpcError(err, rpcName, req));
           throw err;
         } finally {
           log.shoot();
@@ -316,12 +322,6 @@ export default class RPCService {
       });
     };
 
-    // NOTE: 컨슈머가 0개 이상에서 0개가 될 때 자동으로 삭제된다.
-    // 단 한번도 컨슈머가 등록되지 않는다면 영원히 삭제되지 않는데 그런 케이스는 없음
-    await this.channelPool.usingChannel(channel => channel.assertQueue(rpcName, {
-                arguments : {'x-expires': RPC_QUEUE_EXPIRES_MS},
-                durable   : false
-    }));
     this.consumerInfosMap[rpcName] = await this._consume(rpcName, consumer, 'SomeoneCallsMe');
   }
 
@@ -424,6 +424,9 @@ export default class RPCService {
       await this.channelPool.releaseChannel(consumerInfo.channel);
   }
 
+  private async respond() {
+
+  }
   private logRpcError(err, rpcName, req) {
     err.extra = err.extra || { island: this.serviceName, rpcName, req };
     logger.error(`Got an error during ${err.extra.island}/${err.extra.name}` +
