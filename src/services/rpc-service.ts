@@ -166,11 +166,6 @@ function sanitizeAndValidate(content, rpcOptions) {
   return content;
 }
 
-function parseContent(content: Buffer, reviver, rpcOptions) {
-  const parsed = JSON.parse(content.toString('utf8'), reviver);
-  return sanitizeAndValidate(parsed, rpcOptions);
-}
-
 function sanitizeAndValidateResult(res, rpcOptions?: RpcOptions) {
   if (!rpcOptions) return res;
   if (_.get(rpcOptions, 'schema.result.sanitization')) {
@@ -283,14 +278,13 @@ export default class RPCService {
       const log = createTraceLog({ tattoo, timestamp, msg, headers, rpcName, serviceName: this.serviceName });
       this.onGoingRpcRequestCount++;
       return this.enterCLS(tattoo, rpcName, async () => {
-        const req = parseContent(msg.content, reviver, rpcOptions);
-
-        logger.debug(`Got ${rpcName} with ${JSON.stringify(req)}`);
-
         const options = { correlationId, headers };
+        const parsed = JSON.parse(msg.content.toString('utf8'), reviver);
         try {
           await Bluebird.resolve()
-            .then(()  => this.dohook('pre', type, req))
+            .then(()  => sanitizeAndValidate(parsed, rpcOptions))
+            .tap (req => logger.debug(`Got ${rpcName} with ${JSON.stringify(req)}`))
+            .then(req => this.dohook('pre', type, req))
             .then(req => handler(req))
             .then(res => this.dohook('post', type, res))
             .then(res => sanitizeAndValidateResult(res, rpcOptions)) ///< [TODO] 얘를 훅으로 넣고 싶다.
@@ -305,7 +299,7 @@ export default class RPCService {
             .then(err => this.dohook('pre-error', type, err))
             .then(err => this.reply(replyTo, err, options))
             .then(err => this.dohook('post-error', type, err))
-            .tap (err => this.logRpcError(err, rpcName, req));
+            .tap (err => this.logRpcError(err, rpcName, parsed));
           throw err;
         } finally {
           log.shoot();
@@ -383,7 +377,7 @@ export default class RPCService {
     const channel = await this.channelPool.acquireChannel();
     await channel.prefetch(+process.env.RPC_PREFETCH || 1000);
 
-    async function consumer(msg) {
+    const consumer = async msg => {
       try {
         await handler(msg);
         channel.ack(msg);
@@ -391,7 +385,7 @@ export default class RPCService {
         if (this.is503(error)) return nackWithDelay(channel, msg);
         channel.ack(msg);
       }
-    }
+    };
     const result = await channel.consume(key, consumer);
     return { channel, tag: result.consumerTag, key, consumer };
   }
