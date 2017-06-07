@@ -25,7 +25,7 @@ export interface IConsumerInfo {
   options?: RpcOptions;
   key: string;
   consumer: (msg: any) => Promise<void>;
-  consumerOpts: any;
+  consumerOpts?: any;
 }
 
 interface Message {
@@ -182,12 +182,9 @@ function sanitizeAndValidateResult(res, rpcOptions?: RpcOptions) {
   return res;
 }
 
-// 503(Service Temporarily Unavailable) 오류일 때는 응답을 caller에게 안보내줘야함
-function earlyThrowWith503(err) {
-  if (err.statusCode && parseInt(err.statusCode, 10) === 503) {
-    throw err;
-  }
-  return err;
+function nackWithDelay(channel, msg) {
+  setTimeout(() => channel.nack(msg), 1000) as any;
+  return;
 }
 
 export default class RPCService {
@@ -236,7 +233,7 @@ export default class RPCService {
 
     this.channelPool = channelPool;
     await channelPool.usingChannel(channel => channel.assertQueue(this.responseQueue, { exclusive: true }));
-    this.responseConsumerInfo = await this._consume(this.responseQueue, consumer, 'RequestExecutors', {});
+    this.responseConsumerInfo = await this._consume(this.responseQueue, consumer);
   }
 
   public _publish(exchange: any, routingKey: any, content: any, options?: any) {
@@ -266,21 +263,18 @@ export default class RPCService {
     this.hooks[type].push(hook);
   }
 
-  // [TODO] register의 consumer와 _consume의 anonymous function을 하나로 합쳐야 한다.
-  // 무척 헷갈림 @kson //2016-08-09
   // [TODO] Endpoint도 동일하게 RpcService.register를 부르는데, rpcOptions는 Endpoint가 아닌 RPC만 전달한다
   // 포함 관계가 잘못됐다. 애매하다. @kson //2016-08-09
   public async register(rpcName: string,
                         handler: (req: any) => Promise<any>,
                         type: 'endpoint' | 'rpc',
                         rpcOptions?: RpcOptions): Promise<void> {
-    // NOTE: 컨슈머가 0개 이상에서 0개가 될 때 자동으로 삭제된다.
-    // 단 한번도 컨슈머가 등록되지 않는다면 영원히 삭제되지 않는데 그런 케이스는 없음
     await this.channelPool.usingChannel(channel => channel.assertQueue(rpcName, {
       arguments : {'x-expires': RPC_QUEUE_EXPIRES_MS},
       durable   : false
     }));
-    const consumer = (msg: Message) => {
+
+    this.consumerInfosMap[rpcName] = await this._consume(rpcName, (msg: Message) => {
       const { replyTo, headers, correlationId } = msg.properties;
       if (!replyTo) throw ISLAND.FATAL.F0026_MISSING_REPLYTO_IN_RPC;
 
@@ -306,7 +300,7 @@ export default class RPCService {
             .timeout(RPC_EXEC_TIMEOUT_MS);
         } catch (err) {
           await Bluebird.resolve(err)
-            .then(err => earlyThrowWith503(err))
+            .then(err => this.earlyThrowWith503(rpcName, err, msg))
             .tap (err => log.end(err))
             .then(err => this.dohook('pre-error', type, err))
             .then(err => this.reply(replyTo, err, options))
@@ -320,9 +314,7 @@ export default class RPCService {
           }
         }
       });
-    };
-
-    this.consumerInfosMap[rpcName] = await this._consume(rpcName, consumer, 'SomeoneCallsMe');
+    });
   }
 
   public async pause(name: string) {
@@ -384,39 +376,24 @@ export default class RPCService {
     return await p;
   }
 
-  protected async _consume(key: string, handler: (msg) => Promise<any>, tag: string, consumerOpts?: any):
-    Promise<IConsumerInfo> {
+  // There are two kind of consumes - get requested / get a response
+  // * get-requested consumers can be multiple per a node and they shares a RPC queue between island nodes
+  // * get-a-response consumer is only one per a node and it has an exclusive queue
+  protected async _consume(key: string, handler: (msg) => Promise<any>): Promise<IConsumerInfo> {
     const channel = await this.channelPool.acquireChannel();
     await channel.prefetch(+process.env.RPC_PREFETCH || 1000);
 
-    const consumer = async msg => {
+    async function consumer(msg) {
       try {
         await handler(msg);
         channel.ack(msg);
       } catch (error) {
-        if (error.statusCode && parseInt(error.statusCode, 10) === 503) {
-          // Requeue the message when it has a chance
-          setTimeout(() => {
-            channel.nack(msg);
-          }, 1000);
-          return;
-        }
-
-        // Discard the message
+        if (this.is503(error)) return nackWithDelay(channel, msg);
         channel.ack(msg);
-
-        this.channelPool.usingChannel(channel => {
-          const content = RpcResponse.encode(error, this.serviceName);
-          const headers = msg.properties.headers;
-          const correlationId = msg.properties.correlationId;
-          const properties: amqp.Options.Publish = { correlationId, headers };
-          return Promise.resolve(channel.sendToQueue(msg.properties.replyTo, content, properties));
-        });
       }
-    };
-    const result = await channel.consume(key, consumer, consumerOpts || {});
-
-    return { channel, tag: result.consumerTag, key, consumer, consumerOpts };
+    }
+    const result = await channel.consume(key, consumer);
+    return { channel, tag: result.consumerTag, key, consumer };
   }
 
   protected async _cancel(consumerInfo: IConsumerInfo): Promise<void> {
@@ -424,9 +401,17 @@ export default class RPCService {
       await this.channelPool.releaseChannel(consumerInfo.channel);
   }
 
-  private async respond() {
-
+  // 503(Service Temporarily Unavailable) 오류일 때는 응답을 caller에게 안보내줘야함
+  private async earlyThrowWith503(rpcName, err, msg) {
+    // Requeue the message when it has a chance
+    if (this.is503(err)) throw err;
+    return err;
   }
+
+  private is503(err) {
+    return err.statusCode && parseInt(err.statusCode, 10) === 503;
+  }
+
   private logRpcError(err, rpcName, req) {
     err.extra = err.extra || { island: this.serviceName, rpcName, req };
     logger.error(`Got an error during ${err.extra.island}/${err.extra.name}` +
@@ -435,8 +420,8 @@ export default class RPCService {
 
   // returns value again for convenience
   private async reply(replyTo: string, value: any, options: amqp.Options.Publish) {
-    await this.channelPool.usingChannel(channel => {
-      return Promise.resolve(channel.sendToQueue(replyTo, RpcResponse.encode(value, this.serviceName), options));
+    await this.channelPool.usingChannel(async channel => {
+      return channel.sendToQueue(replyTo, RpcResponse.encode(value, this.serviceName), options);
     });
     return value;
   }
