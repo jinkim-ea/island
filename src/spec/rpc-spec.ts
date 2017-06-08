@@ -15,12 +15,11 @@ import { TraceLog } from '../utils/tracelog';
 describe('RPC test:', () => {
   const rpcService = new RPCService('haha');
   const amqpChannelPool = new AmqpChannelPoolService();
-  beforeAll(done => {
+  beforeAll(spec(async () => {
     const url = process.env.RABBITMQ_HOST || 'amqp://rabbitmq:5672';
-    return amqpChannelPool.initialize({ url })
-      .then(() => rpcService.initialize(amqpChannelPool))
-      .then(() => done());
-  });
+    await amqpChannelPool.initialize({ url });
+    await rpcService.initialize(amqpChannelPool);
+  }));
 
   afterAll(done => {
     rpcService.purge()
@@ -130,8 +129,8 @@ describe('RPC test:', () => {
 
   it('should unregister handlers if it failed to send a message', spec(async () => {
     const usingChannel = amqpChannelPool.usingChannel;
-    (amqpChannelPool as any).usingChannel = cb => {
-      cb({
+    (amqpChannelPool as any).usingChannel = async cb => {
+      await cb({
         sendToQueue: (name, content, options) => { throw new Error('haha'); }
       });
     };
@@ -142,8 +141,7 @@ describe('RPC test:', () => {
     } catch (e) {
       expect(e.message).toEqual('haha');
     }
-    expect((rpcService as any).reqTimeouts).toEqual({});
-    expect((rpcService as any).reqExecutors).toEqual({});
+    expect((rpcService as any).waitingRequests).toEqual({});
     amqpChannelPool.usingChannel = usingChannel;
   }));
 

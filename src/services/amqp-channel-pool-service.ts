@@ -45,12 +45,12 @@ export class AmqpChannelPoolService {
     return Promise.resolve(this.initResolver.promise);
   }
 
-  waitForInit(): Promise<void> {
-    return Promise.resolve(this.initResolver.promise);
+  async waitForInit(): Promise<void> {
+    return this.initResolver.promise;
   }
 
-  purge(): Promise<void> {
-    return Promise.resolve(this.connection.close());
+  async purge(): Promise<void> {
+    return this.connection.close();
   }
 
   async acquireChannel(): Promise<amqp.Channel> {
@@ -71,7 +71,7 @@ export class AmqpChannelPoolService {
     return channel.close();
   }
 
-  usingChannel<T>(task: (channel: amqp.Channel) => PromiseLike<T>): Promise<T> {
+  async usingChannel<T>(task: (channel: amqp.Channel) => PromiseLike<T>): Promise<T> {
     return Promise.resolve(Bluebird.using(this.getChannelDisposer(), task));
   }
 

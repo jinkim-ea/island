@@ -182,12 +182,13 @@ function nackWithDelay(channel, msg) {
   return;
 }
 
+type RequestExecutor = { resolve: (msg: Message) => any, reject: (e: Error) => any };
+
 export default class RPCService {
   private consumerInfosMap: { [name: string]: IConsumerInfo } = {};
   private responseQueue: string;
   private responseConsumerInfo: IConsumerInfo;
-  private reqExecutors: { [corrId: string]: (msg: Message) => Promise<any> } = {};
-  private reqTimeouts: { [corrId: string]: any } = {};
+  private waitingRequests: { [corrId: string]: RequestExecutor } = {};
   private channelPool: AmqpChannelPoolService;
   private serviceName: string;
   private hooks: { [key: string]: RpcHook[] };
@@ -214,14 +215,14 @@ export default class RPCService {
         logger.error(`[WARN] msg is null. consume was canceled unexpectedly`);
       }
       const correlationId = msg.properties.correlationId || 'no-correlation-id';
-      const reqExecutor = this.reqExecutors[correlationId];
-      if (!reqExecutor) {
-        // Request timeout이 생겨도 reqExecutor가 없음
+      const waiting = this.waitingRequests[correlationId];
+      if (!waiting) {
+        // Request timeout이 생겨도 waiting이 없음
         logger.notice(`[RPC-WARNING] invalid correlationId ${correlationId}`);
         return Promise.resolve();
       }
-      delete this.reqExecutors[correlationId];
-      return reqExecutor(msg);
+      delete this.waitingRequests[correlationId];
+      return waiting.resolve(msg);
     };
 
     await TraceLog.initialize();
@@ -331,41 +332,36 @@ export default class RPCService {
     delete this.consumerInfosMap[name];
   }
 
+  public throwTimeout(name, corrId: string) {
+    delete this.waitingRequests[corrId];
+    const err = new FatalError(ISLAND.FATAL.F0023_RPC_TIMEOUT,
+                               `RPC(${name} does not return in ${RPC_WAIT_TIMEOUT_MS} ms`);
+    err.statusCode = 504;
+    throw err;
+  }
+
   public async invoke<T, U>(name: string, msg: T, opts?: any): Promise<U>;
-  public async invoke(name: string, msg: any, opts?: any): Promise<any>;
   public async invoke(name: string, msg: any, opts?: any): Promise<any> {
-    const ns = cls.getNamespace('app');
-    const tattoo = ns.get('RequestTrackId');
-    const context = ns.get('Context');
-    const type = ns.get('Type');
-    const correlationId = uuid.v4();
-    const headers = {
-      tattoo,
-      from: { node: process.env.HOSTNAME, context, island: this.serviceName, type }
-    };
-    const content = new Buffer(JSON.stringify(msg), 'utf8');
-    const options: amqp.Options.Publish = {
-      correlationId,
-      expiration: `${RPC_WAIT_TIMEOUT_MS}`, // [FIXME] https://github.com/louy/typed-amqplib/pull/1
-      headers,
-      replyTo: this.responseQueue,
-      timestamp: +(new Date())
-    };
-    const p = this.markTattoo(name, correlationId, tattoo, ns, opts)
+    const option = this.makeInvokeOption();
+    const p = this.waitRequest(option.correlationId!, (msg: Message) => {
+      const res = RpcResponse.decode(msg.content);
+      if (res.result === false) throw res.body;
+      if (opts && opts.withRawdata) return { body: res.body, raw: msg.content };
+      return res.body;
+    })
+      .timeout(RPC_WAIT_TIMEOUT_MS)
+      .catch(Bluebird.TimeoutError, () => this.throwTimeout(name, option.correlationId!))
       .catch(err => {
-        err.tattoo = tattoo;
+        err.tattoo = option.headers.tattoo;
         throw err;
       });
 
+    const content = new Buffer(JSON.stringify(msg), 'utf8');
     try {
-      await this.channelPool.usingChannel(channel => {
-        return Promise.resolve(channel.sendToQueue(name, content, options));
-      });
+      await this.channelPool.usingChannel(async chan => chan.sendToQueue(name, content, option));
     } catch (e) {
-      clearTimeout(this.reqTimeouts[correlationId]);
-      delete this.reqTimeouts[correlationId];
-      delete this.reqExecutors[correlationId];
-      throw e;
+      this.waitingRequests[option.correlationId!].reject(e);
+      delete this.waitingRequests[option.correlationId!];
     }
     return await p;
   }
@@ -393,6 +389,38 @@ export default class RPCService {
   protected async _cancel(consumerInfo: IConsumerInfo): Promise<void> {
       await consumerInfo.channel.cancel(consumerInfo.tag);
       await this.channelPool.releaseChannel(consumerInfo.channel);
+  }
+
+  private waitRequest(corrId: string, handleResponse: (msg: Message) => any) {
+    const p = new Bluebird((resolve, reject) => {
+      this.waitingRequests[corrId] = { resolve, reject };
+    }).then((msg: Message) => {
+      const scoped = cls.getNamespace('app').bind((msg: Message) => {
+        delete this.waitingRequests[corrId];
+        return handleResponse(msg);
+      });
+      return scoped(msg);
+    });
+    return p;
+  }
+
+  private makeInvokeOption(): amqp.Options.Publish {
+    const ns = cls.getNamespace('app');
+    const tattoo = ns.get('RequestTrackId');
+    const context = ns.get('Context');
+    const type = ns.get('Type');
+    const correlationId = uuid.v4();
+    const headers = {
+      tattoo,
+      from: { node: process.env.HOSTNAME, context, island: this.serviceName, type }
+    };
+    return {
+      correlationId,
+      expiration: RPC_WAIT_TIMEOUT_MS,
+      headers,
+      replyTo: this.responseQueue,
+      timestamp: +(new Date())
+    };
   }
 
   // 503(Service Temporarily Unavailable) 오류일 때는 응답을 caller에게 안보내줘야함
@@ -439,36 +467,5 @@ export default class RPCService {
     const hook = this.hooks[hookType];
     if (!hook) return value;
     return Bluebird.reduce(this.hooks[hookType], (value, hook) => hook(value), value);
-  }
-
-  private markTattoo(name: string, corrId: any, tattoo: any, ns: any, opts: any): Promise<any> {
-    return new Promise((resolve, reject) => {
-      // 지저분한데 bluebird .timeout으로 교체할 방법 없을까?
-      // @kson //2016-08-11
-      this.reqTimeouts[corrId] = setTimeout(() => {
-        // Cleanup registered response executors
-        delete this.reqTimeouts[corrId];
-        delete this.reqExecutors[corrId];
-
-        const err = new FatalError(
-          ISLAND.FATAL.F0023_RPC_TIMEOUT,
-          `RPC(${name} does not return in ${RPC_WAIT_TIMEOUT_MS} ms`
-        );
-        err.statusCode = 504;
-        return reject(err);
-      }, RPC_WAIT_TIMEOUT_MS);
-
-      this.reqExecutors[corrId] = ns.bind((msg: Message) => {
-        clearTimeout(this.reqTimeouts[corrId]);
-        delete this.reqTimeouts[corrId];
-
-        const res = RpcResponse.decode(msg.content);
-        if (!res.result) return reject(res.body);
-        if (opts && opts.withRawdata) {
-          return resolve({ body: res.body, raw: msg.content });
-        }
-        return resolve(res.body);
-      });
-    });
   }
 }
