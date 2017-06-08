@@ -97,6 +97,7 @@ export namespace ISLAND {
     F0023_RPC_TIMEOUT                         = 23,
     F0024_ENDPOINT_METHOD_REDECLARED          = 24,
     F0025_MISSING_ADAPTER_OPTIONS             = 25,
-    F0026_MISSING_REPLYTO_IN_RPC              = 26
+    F0026_MISSING_REPLYTO_IN_RPC              = 26,
+    F0027_CONSUMER_IS_CANCELED                = 27
   }
 }

@@ -9,11 +9,15 @@ import uuid = require('uuid');
 
 import { RpcOptions } from '../controllers/rpc-decorator';
 import { sanitize, validate } from '../middleware/schema.middleware';
-import { AbstractError, AbstractFatalError, AbstractLogicError, FatalError, ISLAND, LogicError } from '../utils/error';
+import { FatalError, ISLAND, LogicError } from '../utils/error';
 import { logger } from '../utils/logger';
 import reviver from '../utils/reviver';
+import { RpcRequest } from '../utils/rpc-request';
+import { IRpcResponse, RpcResponse } from '../utils/rpc-response';
 import { TraceLog } from '../utils/tracelog';
 import { AmqpChannelPoolService } from './amqp-channel-pool-service';
+
+export { IRpcResponse, RpcRequest, RpcResponse };
 
 const RPC_EXEC_TIMEOUT_MS = parseInt(process.env.ISLAND_RPC_EXEC_TIMEOUT_MS, 10) || 25000;
 const RPC_WAIT_TIMEOUT_MS = parseInt(process.env.ISLAND_RPC_WAIT_TIMEOUT_MS, 10) || 60000;
@@ -34,100 +38,6 @@ interface Message {
   properties: amqp.Options.Publish;
 }
 
-export interface IRpcResponse {
-  version: number;
-  result: boolean;
-  body?: AbstractError | any;
-}
-
-export interface RpcRequest {
-  name: string;
-  msg: any;
-  options: RpcOptions;
-}
-
-export class RpcResponse {
-  static reviver: ((k, v) => any) | undefined = reviver;
-  static encode(body: any, serviceName: string): Buffer {
-    const res: IRpcResponse = {
-      body,
-      result: body instanceof Error ? false : true,
-      version: 1
-    };
-
-    return new Buffer(JSON.stringify(res, (k, v: AbstractError | number | boolean) => {
-      // TODO instanceof Error should AbstractError
-      if (v instanceof Error) {
-        const e = v as AbstractError;
-        return {
-          debugMsg: e.debugMsg,
-          errorCode: e.errorCode,
-          errorKey: e.errorKey,
-          errorNumber: e.errorNumber,
-          errorType: e.errorType,
-          extra: e.extra,
-          message: e.message,
-          name: e.name,
-          occurredIn: e.occurredIn || serviceName,
-          stack: e.stack,
-          statusCode: e.statusCode
-        };
-      }
-      return v;
-    }), 'utf8');
-  }
-
-  static decode(msg: Buffer): IRpcResponse {
-    try {
-      const res: IRpcResponse = JSON.parse(msg.toString('utf8'), RpcResponse.reviver);
-      if (!res.result) res.body = this.getAbstractError(res.body);
-
-      return res;
-    } catch (e) {
-      logger.notice('[decode error]', e);
-      return { version: 0, result: false };
-    }
-  }
-
- static getAbstractError(err: AbstractError): AbstractError {
-    let result: AbstractError;
-    const enumObj = {};
-    enumObj[err.errorNumber] = err.errorKey;
-    const occurredIn = err.extra && err.extra.island || err.occurredIn;
-    switch (err.errorType) {
-      case 'LOGIC':
-        result = new AbstractLogicError(err.errorNumber, err.debugMsg, occurredIn, enumObj);
-        break;
-      case 'FATAL':
-        result = new AbstractFatalError(err.errorNumber, err.debugMsg, occurredIn, enumObj);
-        break;
-      default:
-        result = new AbstractError('ETC', 1, err.message, occurredIn, { 1: 'F0001' });
-        result.name = 'ETCError';
-    }
-
-    result.statusCode = err.statusCode;
-    result.stack = err.stack;
-    result.extra = err.extra;
-    result.occurredIn = err.occurredIn;
-
-    return result;
-  }
-}
-
-function enterScope(properties: any, func): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const ns = cls.getNamespace('app');
-    ns.run(() => {
-      _.each(properties, (value, key: string) => {
-        ns.set(key, value);
-      });
-      Bluebird.try(func).then(resolve).catch(reject);
-    });
-  });
-}
-
-// [TODO] should be (value: T) => Promise<T>
 export type RpcHook = (rpc) => Promise<any>;
 export enum RpcHookType {
   PRE_ENDPOINT,
@@ -179,16 +89,17 @@ function sanitizeAndValidateResult(res, rpcOptions?: RpcOptions) {
 
 function nackWithDelay(channel, msg) {
   setTimeout(() => channel.nack(msg), 1000) as any;
-  return;
 }
 
-type RequestExecutor = { resolve: (msg: Message) => any, reject: (e: Error) => any };
+type DeferredResponse = { resolve: (msg: Message) => any, reject: (e: Error) => any };
 
 export default class RPCService {
   private consumerInfosMap: { [name: string]: IConsumerInfo } = {};
-  private responseQueue: string;
+  private responseQueueName: string;
   private responseConsumerInfo: IConsumerInfo;
-  private waitingRequests: { [corrId: string]: RequestExecutor } = {};
+  private waitingResponse: { [corrId: string]: DeferredResponse } = {};
+  private timedOut: { [corrId: string]: string } = {};
+  private timedOutOrdered: string[] = [];
   private channelPool: AmqpChannelPoolService;
   private serviceName: string;
   private hooks: { [key: string]: RpcHook[] };
@@ -206,30 +117,15 @@ export default class RPCService {
     } else {
       RpcResponse.reviver = reviver;
     }
-    // NOTE: live docker 환경에서는 같은 hostname + process.pid 조합이 유일하지 않을 수 있다
-    // docker 내부의 process id 는 1인 경우가 대부분이며 host=net으로 실행시키는 경우 hostname도 동일할 수 있다.
-    this.responseQueue = `rpc.res.${this.serviceName}.${os.hostname()}.${uuid.v4()}`;
-    logger.info(`consuming ${this.responseQueue}`);
-    const consumer = (msg: Message) => {
-      if (!msg) {
-        logger.error(`[WARN] msg is null. consume was canceled unexpectedly`);
-      }
-      const correlationId = msg.properties.correlationId || 'no-correlation-id';
-      const waiting = this.waitingRequests[correlationId];
-      if (!waiting) {
-        // Request timeout이 생겨도 waiting이 없음
-        logger.notice(`[RPC-WARNING] invalid correlationId ${correlationId}`);
-        return Promise.resolve();
-      }
-      delete this.waitingRequests[correlationId];
-      return waiting.resolve(msg);
-    };
+    this.responseQueueName = this.makeResponseQueueName();
+    logger.info(`consuming ${this.responseQueueName}`);
 
     await TraceLog.initialize();
 
     this.channelPool = channelPool;
-    await channelPool.usingChannel(channel => channel.assertQueue(this.responseQueue, { exclusive: true }));
-    this.responseConsumerInfo = await this._consume(this.responseQueue, consumer);
+    await channelPool.usingChannel(channel => channel.assertQueue(this.responseQueueName, { exclusive: true }));
+
+    this.responseConsumerInfo = await this.consumeForResponse();
   }
 
   @deprecated()
@@ -240,18 +136,21 @@ export default class RPCService {
   }
 
   public async purge() {
-    this.hooks = {};
     return Promise.all(_.map(this.consumerInfosMap, async consumerInfo => {
       logger.info('stop serving', consumerInfo.key);
       await this.pause(consumerInfo.key);
       delete this.consumerInfosMap[consumerInfo.key];
     }))
-      .then((): Promise<any> => {
+      .then(async () => {
         if (this.onGoingRpcRequestCount > 0) {
           return new Promise((res, rej) => { this.purging = res; });
         }
-        return Promise.resolve();
-    });
+      })
+      .then(() => {
+        this.hooks = {};
+        this.timedOut = {};
+        this.timedOutOrdered = [];
+      });
   }
 
   public registerHook(type: RpcHookType, hook: RpcHook) {
@@ -259,8 +158,6 @@ export default class RPCService {
     this.hooks[type].push(hook);
   }
 
-  // [TODO] Endpoint도 동일하게 RpcService.register를 부르는데, rpcOptions는 Endpoint가 아닌 RPC만 전달한다
-  // 포함 관계가 잘못됐다. 애매하다. @kson //2016-08-09
   public async register(rpcName: string,
                         handler: (req: any) => Promise<any>,
                         type: 'endpoint' | 'rpc',
@@ -277,18 +174,18 @@ export default class RPCService {
       const tattoo = headers && headers.tattoo;
       const timestamp = msg.properties.timestamp || 0;
       const log = createTraceLog({ tattoo, timestamp, msg, headers, rpcName, serviceName: this.serviceName });
-      this.onGoingRpcRequestCount++;
       return this.enterCLS(tattoo, rpcName, async () => {
         const options = { correlationId, headers };
         const parsed = JSON.parse(msg.content.toString('utf8'), reviver);
         try {
+          this.onGoingRpcRequestCount++;
           await Bluebird.resolve()
             .then(()  => sanitizeAndValidate(parsed, rpcOptions))
             .tap (req => logger.debug(`Got ${rpcName} with ${JSON.stringify(req)}`))
             .then(req => this.dohook('pre', type, req))
             .then(req => handler(req))
             .then(res => this.dohook('post', type, res))
-            .then(res => sanitizeAndValidateResult(res, rpcOptions)) ///< [TODO] 얘를 훅으로 넣고 싶다.
+            .then(res => sanitizeAndValidateResult(res, rpcOptions))
             .then(res => this.reply(replyTo, res, options))
             .tap (()  => log.end())
             .tap (res => logger.debug(`responses ${JSON.stringify(res)}`))
@@ -332,14 +229,6 @@ export default class RPCService {
     delete this.consumerInfosMap[name];
   }
 
-  public throwTimeout(name, corrId: string) {
-    delete this.waitingRequests[corrId];
-    const err = new FatalError(ISLAND.FATAL.F0023_RPC_TIMEOUT,
-                               `RPC(${name} does not return in ${RPC_WAIT_TIMEOUT_MS} ms`);
-    err.statusCode = 504;
-    throw err;
-  }
-
   public async invoke<T, U>(name: string, msg: T, opts?: {withRawdata: boolean}): Promise<U>;
   public async invoke(name: string, msg: any, opts?: {withRawdata: boolean}): Promise<any> {
     const option = this.makeInvokeOption();
@@ -360,8 +249,8 @@ export default class RPCService {
     try {
       await this.channelPool.usingChannel(async chan => chan.sendToQueue(name, content, option));
     } catch (e) {
-      this.waitingRequests[option.correlationId!].reject(e);
-      delete this.waitingRequests[option.correlationId!];
+      this.waitingResponse[option.correlationId!].reject(e);
+      delete this.waitingResponse[option.correlationId!];
     }
     return await p;
   }
@@ -379,6 +268,7 @@ export default class RPCService {
         channel.ack(msg);
       } catch (error) {
         if (this.is503(error)) return nackWithDelay(channel, msg);
+        if (this.isCritical(error)) return this.shutdown();
         channel.ack(msg);
       }
     };
@@ -387,19 +277,71 @@ export default class RPCService {
   }
 
   protected async _cancel(consumerInfo: IConsumerInfo): Promise<void> {
-      await consumerInfo.channel.cancel(consumerInfo.tag);
-      await this.channelPool.releaseChannel(consumerInfo.channel);
+    await consumerInfo.channel.cancel(consumerInfo.tag);
+    await this.channelPool.releaseChannel(consumerInfo.channel);
+  }
+
+  private throwTimeout(name, corrId: string) {
+    delete this.waitingResponse[corrId];
+    this.timedOut[corrId] = name;
+    this.timedOutOrdered.push(corrId);
+    if (20 < this.timedOutOrdered.length) {
+      delete this.timedOut[this.timedOutOrdered.shift()!];
+    }
+    const err = new FatalError(ISLAND.FATAL.F0023_RPC_TIMEOUT,
+                               `RPC(${name} does not return in ${RPC_WAIT_TIMEOUT_MS} ms`);
+    err.statusCode = 504;
+    throw err;
+  }
+
+  private shutdown() {
+    process.emit('SIGTERM');
+  }
+
+  private makeResponseQueueName() {
+    // NOTE: live docker 환경에서는 같은 hostname + process.pid 조합이 유일하지 않을 수 있다
+    // docker 내부의 process id 는 1인 경우가 대부분이며 host=net으로 실행시키는 경우 hostname도 동일할 수 있다.
+    return `rpc.res.${this.serviceName}.${os.hostname()}.${uuid.v4()}`;
+  }
+
+  private consumeForResponse() {
+    return this._consume(this.responseQueueName, (msg: Message | null) => {
+      if (!msg) {
+        logger.crit(`The consumer is canceled, will lose following responses - https://goo.gl/HIgy4D`);
+        throw new FatalError(ISLAND.FATAL.F0027_CONSUMER_IS_CANCELED);
+      }
+      const correlationId = msg.properties.correlationId;
+      if (!correlationId) {
+        logger.notice('Got a response with no correlationId');
+        return;
+      }
+      if (this.timedOut[correlationId]) {
+        const name = this.timedOut[correlationId];
+        delete this.timedOut[correlationId];
+        _.pull(this.timedOutOrdered, correlationId);
+
+        logger.warning(`Got a response of \`${name}\` after timed out - ${correlationId}`);
+        return;
+      }
+      const waiting = this.waitingResponse[correlationId];
+      if (!waiting) {
+        logger.notice(`Got an unknown response - ${correlationId}`);
+        return;
+      }
+      delete this.waitingResponse[correlationId];
+      return waiting.resolve(msg);
+    });
   }
 
   private waitRequest(corrId: string, handleResponse: (msg: Message) => any) {
     const p = new Bluebird((resolve, reject) => {
-      this.waitingRequests[corrId] = { resolve, reject };
+      this.waitingResponse[corrId] = { resolve, reject };
     }).then((msg: Message) => {
-      const scoped = cls.getNamespace('app').bind((msg: Message) => {
-        delete this.waitingRequests[corrId];
+      const clsScoped = cls.getNamespace('app').bind((msg: Message) => {
+        delete this.waitingResponse[corrId];
         return handleResponse(msg);
       });
-      return scoped(msg);
+      return clsScoped(msg);
     });
     return p;
   }
@@ -418,7 +360,7 @@ export default class RPCService {
       correlationId,
       expiration: RPC_WAIT_TIMEOUT_MS,
       headers,
-      replyTo: this.responseQueue,
+      replyTo: this.responseQueueName,
       timestamp: +(new Date())
     };
   }
@@ -432,6 +374,10 @@ export default class RPCService {
 
   private is503(err) {
     return err.statusCode && parseInt(err.statusCode, 10) === 503;
+  }
+
+  private isCritical(err) {
+    return err.errorCode === 'ISLAND.FATAL.F0027_CONSUMER_IS_CANCELED';
   }
 
   private logRpcError(err, rpcName, req) {
@@ -450,7 +396,16 @@ export default class RPCService {
 
   // enter continuation-local-storage scope
   private enterCLS(tattoo, rpcName, func) {
-    return enterScope({ RequestTrackId: tattoo, Context: rpcName, Type: 'rpc' }, func);
+    const properties = { RequestTrackId: tattoo, Context: rpcName, Type: 'rpc' };
+    return new Promise((resolve, reject) => {
+      const ns = cls.getNamespace('app');
+      ns.run(() => {
+        _.each(properties, (value, key: string) => {
+          ns.set(key, value);
+        });
+        Bluebird.try(func).then(resolve).catch(reject);
+      });
+    });
   }
 
   private async dohook(prefix: 'pre' | 'post' | 'pre-error' | 'post-error', type: 'endpoint' | 'rpc', value) {
