@@ -3,14 +3,39 @@ require('source-map-support').install();
 process.env.ISLAND_RPC_WAIT_TIMEOUT_MS = 3000;
 process.env.ISLAND_SERVICE_LOAD_TIME_MS = 1000;
 
-import Bluebird = require('bluebird');
+import * as Bluebird from 'bluebird';
 
 import { RpcOptions } from '../controllers/rpc-decorator';
 import paramSchemaInspector from '../middleware/schema.middleware';
 import { AmqpChannelPoolService } from '../services/amqp-channel-pool-service';
-import RPCService, { RpcHookType, RpcRequest } from '../services/rpc-service';
+import RPCService, { RpcHookType, RpcRequest, RpcResponse } from '../services/rpc-service';
+import { AbstractFatalError, FatalError, ISLAND } from '../utils/error';
 import { jasmineAsyncAdapter as spec } from '../utils/jasmine-async-support';
 import { TraceLog } from '../utils/tracelog';
+
+// tslint:disable-next-line no-var-requires
+const stdMocks = require('std-mocks');
+
+async function mock(func) {
+    stdMocks.use();
+    await func();
+    const output = stdMocks.flush();
+    stdMocks.restore();
+    return output;
+}
+
+describe('RpcResponse', () => {
+  it('should handle malformed response', () => {
+    const malformedJson = '{"result": true, "body": 1';
+    expect(RpcResponse.decode(new Buffer(malformedJson))).toEqual({version: 0, result: false});
+  });
+
+  it('should understand an AbstractError object', () => {
+    const error = new FatalError(ISLAND.FATAL.F0001_ISLET_ALREADY_HAS_BEEN_REGISTERED);
+    const json = JSON.stringify({result: false, body: error});
+    expect(RpcResponse.decode(new Buffer(json)).body).toEqual(jasmine.any(AbstractFatalError));
+  });
+});
 
 describe('RPC test:', () => {
   const rpcService = new RPCService('haha');
@@ -226,6 +251,44 @@ describe('RPC test:', () => {
       expect(e.errorCode).toBe('ISLAND.LOGIC.L0002_WRONG_PARAMETER_SCHEMA');
       expect(e.occurredIn).toBe('third');
     }
+  }));
+
+  it('should be canceled by timeout', spec(async () => {
+    try {
+      await rpcService.invoke('unmethod', 'arg');
+      fail();
+    } catch (e) {
+      expect(e.errorCode).toEqual('ISLAND.FATAL.F0023_RPC_TIMEOUT');
+    }
+  }));
+
+  it('should retry when it comes with 503 status code', spec(async () => {
+    let called = 0;
+    await rpcService.register('testMethod', msg => {
+      called++;
+      const e = new Error('custom error');
+      (e as any).statusCode = 503;
+      throw e;
+    }, 'rpc');
+    await rpcService.invoke('testMethod', 'hello').catch(e => e);
+    expect(called).toEqual(3);
+  }));
+
+  it('should also return a raw buffer with an option', spec(async () => {
+    await rpcService.register('testMethod', async () => {
+      return 'haha';
+    }, 'rpc');
+    const res = await rpcService.invoke<string, {body: string, raw: Buffer}>
+                        ('testMethod', 'hello', {withRawdata: true});
+    expect(res.body).toEqual('haha');
+    expect(res.raw).toEqual(jasmine.any(Buffer));
+  }));
+
+  it('should deprecate RPCService#_publish', spec(async () => {
+    const output = await mock(async () => {
+      await rpcService._publish('xexchange', 'xroutingKey', new Buffer('3'));
+    });
+    expect(output.stderr[0].split('\n')[0]).toEqual('Method `_publish` has been deprecated.');
   }));
 });
 

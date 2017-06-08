@@ -39,6 +39,7 @@
     "cls-mongoose": "^2.0.1",
     "continuation-local-storage": "^3.2.0",
     "debug": "^2.2.0",
+    "deprecated-decorator": "^0.1.6",
     "dns-consul": "^1.0.0",
     "inversify": "2.0.0-beta.5",
     "island-di": "^1.1.0",

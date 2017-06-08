@@ -2,6 +2,7 @@ import * as cls from 'continuation-local-storage';
 
 import * as amqp from 'amqplib';
 import * as Bluebird from 'bluebird';
+import deprecated from 'deprecated-decorator';
 import * as _ from 'lodash';
 import * as os from 'os';
 import uuid = require('uuid');
@@ -33,7 +34,7 @@ interface Message {
   properties: amqp.Options.Publish;
 }
 
-interface IRpcResponse {
+export interface IRpcResponse {
   version: number;
   result: boolean;
   body?: AbstractError | any;
@@ -45,7 +46,7 @@ export interface RpcRequest {
   options: RpcOptions;
 }
 
-class RpcResponse {
+export class RpcResponse {
   static reviver: ((k, v) => any) | undefined = reviver;
   static encode(body: any, serviceName: string): Buffer {
     const res: IRpcResponse = {
@@ -77,7 +78,6 @@ class RpcResponse {
   }
 
   static decode(msg: Buffer): IRpcResponse {
-    if (!msg) return { version: 0, result: false };
     try {
       const res: IRpcResponse = JSON.parse(msg.toString('utf8'), RpcResponse.reviver);
       if (!res.result) res.body = this.getAbstractError(res.body);
@@ -232,6 +232,7 @@ export default class RPCService {
     this.responseConsumerInfo = await this._consume(this.responseQueue, consumer);
   }
 
+  @deprecated()
   public _publish(exchange: any, routingKey: any, content: any, options?: any) {
     return this.channelPool.usingChannel(channel => {
       return Promise.resolve(channel.publish(exchange, routingKey, content, options));
@@ -240,7 +241,6 @@ export default class RPCService {
 
   public async purge() {
     this.hooks = {};
-    if (!this.consumerInfosMap) return Promise.resolve();
     return Promise.all(_.map(this.consumerInfosMap, async consumerInfo => {
       logger.info('stop serving', consumerInfo.key);
       await this.pause(consumerInfo.key);
@@ -340,8 +340,8 @@ export default class RPCService {
     throw err;
   }
 
-  public async invoke<T, U>(name: string, msg: T, opts?: any): Promise<U>;
-  public async invoke(name: string, msg: any, opts?: any): Promise<any> {
+  public async invoke<T, U>(name: string, msg: T, opts?: {withRawdata: boolean}): Promise<U>;
+  public async invoke(name: string, msg: any, opts?: {withRawdata: boolean}): Promise<any> {
     const option = this.makeInvokeOption();
     const p = this.waitRequest(option.correlationId!, (msg: Message) => {
       const res = RpcResponse.decode(msg.content);
