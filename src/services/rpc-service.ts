@@ -232,7 +232,7 @@ export default class RPCService {
   public async invoke<T, U>(name: string, msg: T, opts?: {withRawdata: boolean}): Promise<U>;
   public async invoke(name: string, msg: any, opts?: {withRawdata: boolean}): Promise<any> {
     const option = this.makeInvokeOption();
-    const p = this.waitRequest(option.correlationId!, (msg: Message) => {
+    const p = this.waitResponse(option.correlationId!, (msg: Message) => {
       const res = RpcResponse.decode(msg.content);
       if (res.result === false) throw res.body;
       if (opts && opts.withRawdata) return { body: res.body, raw: msg.content };
@@ -333,8 +333,8 @@ export default class RPCService {
     });
   }
 
-  private waitRequest(corrId: string, handleResponse: (msg: Message) => any) {
-    const p = new Bluebird((resolve, reject) => {
+  private waitResponse(corrId: string, handleResponse: (msg: Message) => any) {
+    return new Bluebird((resolve, reject) => {
       this.waitingResponse[corrId] = { resolve, reject };
     }).then((msg: Message) => {
       const clsScoped = cls.getNamespace('app').bind((msg: Message) => {
@@ -343,7 +343,6 @@ export default class RPCService {
       });
       return clsScoped(msg);
     });
-    return p;
   }
 
   private makeInvokeOption(): amqp.Options.Publish {

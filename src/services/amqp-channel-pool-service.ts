@@ -71,8 +71,8 @@ export class AmqpChannelPoolService {
     return channel.close();
   }
 
-  async usingChannel<T>(task: (channel: amqp.Channel) => PromiseLike<T>): Promise<T> {
-    return Promise.resolve(Bluebird.using(this.getChannelDisposer(), task));
+  async usingChannel<T>(task: (channel: amqp.Channel) => PromiseLike<T>) {
+    return Bluebird.using(this.getChannelDisposer(), task);
   }
 
   getChannelDisposer(): Bluebird.Disposer<amqp.Channel> {
