@@ -132,6 +132,6 @@ export default class Islet {
       logger.debug('destroy : ', key);
       await adapter.destroy();
     }));
-    this.onDestroy();
+    await this.onDestroy();
   }
 }

@@ -37,7 +37,7 @@ export class AmqpChannelPoolService {
     try {
       const connection = await amqp.connect(options.url, options.socketOptions);
 
-      logger.info(`connected to ${options.url}`);
+      logger.info(`connected to ${options.url} for ${options.name}`);
       this.connection = connection;
       this.initResolver.resolve();
     } catch (e) { this.initResolver.reject(e); }

@@ -1,4 +1,4 @@
-tasks.json
+.vscode
 dist
 package
 island-*.tgz
