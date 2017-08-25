@@ -96,6 +96,7 @@ export {
 } from './utils/jasmine-async-support';
 export {
   AbstractError,
+  AbstractEtcError,
   AbstractExpectedError,
   AbstractFatalError,
   AbstractLogicError,
