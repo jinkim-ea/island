@@ -94,9 +94,13 @@ export default class PushService {
           broadcastExchange.type, PushService.broadcastExchange.options);
       });
       await channel.assertExchange(playerPushX.name, playerPushX.type, playerPushX.options);
-      await channel.assertQueue(PushService.autoDeleteTriggerQueue.name, PushService.autoDeleteTriggerQueue.options);
       await channel.bindExchange(PushService.broadcastExchange.name.pc, PushService.broadcastExchange.name.all, '');
       await channel.bindExchange(PushService.broadcastExchange.name.mobile, PushService.broadcastExchange.name.all, '');
+      try {
+        await channel.assertQueue(PushService.autoDeleteTriggerQueue.name, PushService.autoDeleteTriggerQueue.options);
+      } catch (e) {
+        logger.info(`asserting queue ${PushService.autoDeleteTriggerQueue.name} failed, but ignored`);
+      }
     });
   }
 
