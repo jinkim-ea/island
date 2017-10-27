@@ -163,6 +163,59 @@ export default class PushService {
   }
 
   /**
+   * bind specific queue wrapper
+   * @param queue
+   * @param source
+   * @param pattern
+   * @param sourceType
+   * @param sourceOpts
+   * @returns {Promise<any>}
+   */
+  async bindQueue(queue: string,
+                  source: string,
+                  pattern: string = '',
+                  sourceType: string = 'fanout',
+                  sourceOpts: any = PushService.DEFAULT_EXCHANGE_OPTIONS
+  ): Promise<any> {
+    logger.debug(`bind queue. ${source} ==${pattern}==> ${queue}`);
+    let sourceDeclared = false;
+    try {
+      await this.channelPool.usingChannel(async channel => {
+        await channel.assertExchange(source, sourceType, sourceOpts);
+        sourceDeclared = true;
+        await channel.bindQueue(queue, source, pattern);
+      });
+    } catch (e) {
+      // Auto-delete is triggered only when target exchange(or queue) is unbound or deleted.
+      // If previous bind fails, we can't ensure auto-delete triggered or not.
+      // Below workaround prevents this from happening.
+      // caution: Binding x-recent-history exchange to unroutable target causes connection loss.
+      // target should be a queue and routable.
+      if (sourceDeclared && sourceOpts.autoDelete) {
+        await this.channelPool.usingChannel(async channel => {
+          await channel.bindQueue(PushService.autoDeleteTriggerQueue.name, source, '');
+          await channel.unbindQueue(PushService.autoDeleteTriggerQueue.name, source, '');
+        });
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * unbind queue wrapper
+   * @param queue
+   * @param source
+   * @param pattern
+   * @returns {Promise<any>}
+   */
+  async unbindQueue(queue: string, source: string, pattern: string = ''): Promise<any> {
+    logger.debug(`unbind queue; ${source} --${pattern}--X ${queue}`);
+    return this.channelPool.usingChannel(channel => {
+      return channel.unbindQueue(queue, source, pattern, {});
+    });
+  }
+
+  /**
    * publish message to a player
    * @param pid
    * @param msg

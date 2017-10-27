@@ -51,6 +51,24 @@ export default class PushService {
      */
     unbindExchange(destination: string, source: string, pattern?: string): Promise<any>;
     /**
+     * bind specific queue wrapper
+     * @param queue
+     * @param source
+     * @param pattern
+     * @param sourceType
+     * @param sourceOpts
+     * @returns {Promise<any>}
+     */
+    bindQueue(queue: string, source: string, pattern?: string, sourceType?: string, sourceOpts?: any): Promise<any>;
+    /**
+     * unbind queue wrapper
+     * @param queue
+     * @param source
+     * @param pattern
+     * @returns {Promise<any>}
+     */
+    unbindQueue(queue: string, source: string, pattern?: string): Promise<any>;
+    /**
      * publish message to a player
      * @param pid
      * @param msg

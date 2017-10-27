@@ -128,6 +128,57 @@ class PushService {
         });
     }
     /**
+     * bind specific queue wrapper
+     * @param queue
+     * @param source
+     * @param pattern
+     * @param sourceType
+     * @param sourceOpts
+     * @returns {Promise<any>}
+     */
+    bindQueue(queue, source, pattern = '', sourceType = 'fanout', sourceOpts = PushService.DEFAULT_EXCHANGE_OPTIONS) {
+        return __awaiter(this, void 0, void 0, function* () {
+            logger_1.logger.debug(`bind queue. ${source} ==${pattern}==> ${queue}`);
+            let sourceDeclared = false;
+            try {
+                yield this.channelPool.usingChannel((channel) => __awaiter(this, void 0, void 0, function* () {
+                    yield channel.assertExchange(source, sourceType, sourceOpts);
+                    sourceDeclared = true;
+                    yield channel.bindQueue(queue, source, pattern);
+                }));
+            }
+            catch (e) {
+                // Auto-delete is triggered only when target exchange(or queue) is unbound or deleted.
+                // If previous bind fails, we can't ensure auto-delete triggered or not.
+                // Below workaround prevents this from happening.
+                // caution: Binding x-recent-history exchange to unroutable target causes connection loss.
+                // target should be a queue and routable.
+                if (sourceDeclared && sourceOpts.autoDelete) {
+                    yield this.channelPool.usingChannel((channel) => __awaiter(this, void 0, void 0, function* () {
+                        yield channel.bindQueue(PushService.autoDeleteTriggerQueue.name, source, '');
+                        yield channel.unbindQueue(PushService.autoDeleteTriggerQueue.name, source, '');
+                    }));
+                }
+                throw e;
+            }
+        });
+    }
+    /**
+     * unbind queue wrapper
+     * @param queue
+     * @param source
+     * @param pattern
+     * @returns {Promise<any>}
+     */
+    unbindQueue(queue, source, pattern = '') {
+        return __awaiter(this, void 0, void 0, function* () {
+            logger_1.logger.debug(`unbind queue; ${source} --${pattern}--X ${queue}`);
+            return this.channelPool.usingChannel(channel => {
+                return channel.unbindQueue(queue, source, pattern, {});
+            });
+        });
+    }
+    /**
      * publish message to a player
      * @param pid
      * @param msg
